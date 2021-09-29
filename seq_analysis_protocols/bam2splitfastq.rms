@@ -1,0 +1,29 @@
+
+##python
+
+import sys
+import os
+
+print "##sheet=EOF"
+print "Sample Bamfile"
+
+for arg in sys.argv[1:]:
+    sample = os.path.basename(arg)
+    if sample.endswith(".bam"):
+        sample = sample.replace(".bam", "")
+    elif sample.endswith(".cram"):
+        sample = sample.replace(".cram", "")
+    else:
+        sys.stderr.write("Error:  File not BAM or CRAM file:  %s\n" % arg)
+        sys.exit(-1)
+
+    print sample, arg
+
+print "EOF"
+
+#### bam2splitfastq bamfile -
+##mem=55
+
+export REF_PATH=/home/bioinfo/software/knightlab/genomes/cache/%2s/%2s/%s
+
+/home/jk2269/binc/bam2splitfastq <sample> <bamfile>

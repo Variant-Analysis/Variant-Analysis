@@ -1,0 +1,140 @@
+#!/usr/bin/env rms
+
+##python
+
+import sys
+import os.path
+import re
+
+genome = ""
+cohort = "output"
+nodes = ""
+
+# Check the command-line arguments, and output the genome name and chromosome ordering.
+argn = 1
+while argn < len(sys.argv):
+    if sys.argv[argn] == "-19":
+        genome = "hs37d5"
+        argn += 1
+    elif sys.argv[argn] == "-38":
+        genome = "hg38"
+        argn += 1
+    elif argn + 1 < len(sys.argv) and sys.argv[argn] == "-o":
+        cohort = sys.argv[argn+1]
+        argn += 2
+    elif argn + 1 < len(sys.argv) and sys.argv[argn] == "-n":
+        nodes = sys.argv[argn+1]
+        argn += 2
+    else:
+        break
+
+if argn == len(sys.argv) or len(genome) == 0:
+    sys.stderr.write("Usage:  hapmappca.rms [-o prefix] [-n #] { -19 | -38 } sampleDir...\n")
+    sys.stderr.write("                -19  - Use hg19 as the reference genome.  One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -38  - Use GRCh38 as the reference genome. One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -o prefix - Prefix to use for the output filenames.\n")
+    sys.stderr.write("                -n #      - Limit the number of compute nodes (same as RMS -n option format)\n")
+    sys.exit(-1)
+
+sys.stdout.write("##sheet=EOF\n")
+sys.stdout.write("Sample\tPath\n")
+for arg in sys.argv[argn:]:
+    dir = arg
+    if dir.endswith("/"):
+        dir = dir[:-1]
+
+    sampleName = os.path.basename(dir)
+    bamfile = dir + "/" + sampleName + ".bam"
+    if not os.path.isfile(bamfile):
+        bamfile = dir + "/" + sampleName + ".cram"
+        if not os.path.isfile(bamfile):
+            sys.stderr.write("Error:  Cannot find BAM file in sample directory:  " + bamfile + "\n")
+            sys.exit(-1)
+
+    sys.stdout.write("%s\t%s\n" % (sampleName, bamfile))
+
+sys.stdout.write("EOF\n")
+
+if nodes:
+   sys.stdout.write('##option="-n %s"\n' % nodes)
+
+sys.stdout.write("##genome=( %s )\n" % genome)
+sys.stdout.write("##cohort=( %s )\n" % cohort)
+
+##env
+
+alias pbm="source /home/bioinfo/software/knightlab/bin_Mar2016.ruddle/pbmscript.sh"
+
+source /home/bioinfo/software/knightlab/setup-lang.sh
+
+pbm samtools
+pbm eigenstrat
+
+ROOTDIR=/home/bioinfo/software/knightlab/soft/pcaHapmap_Mar2016
+
+#### pileup sample <sample>/hapmappca_<sample>.ped
+##io=6
+
+samtools mpileup -l $ROOTDIR/<genome>_Final_SNPs_n1824.snplist <path> | python $ROOTDIR/parsePileup.py <sample> $ROOTDIR/<genome>_Final_SNPs_n1824.txt > <sample>/hapmappca_<sample>.ped
+
+#### plink all -
+
+rm -f <cohort>_PCA_plink.ped
+for dir in <sample> ; do
+    cat $dir/hapmappca_$dir.ped >> <cohort>_PCA_plink.ped
+done
+
+cp $ROOTDIR/<genome>_PCA_plink.map <cohort>_PCA_plink.map
+
+/home/mc854/EIGENSTRAT/plink --file <cohort>_PCA_plink --geno 0.02 --noweb \
+    --bmerge $ROOTDIR/hapmap_final_snps.bed $ROOTDIR/hapmap_final_snps.bim $ROOTDIR/hapmap_final_snps.fam \
+    --recode --out <cohort>_hapmap
+
+#### convert all -
+
+cat << EOF > <cohort>_PAR.conv.txt
+genotypename: <cohort>_hapmap.ped
+snpname: <cohort>_hapmap.map
+indivname: <cohort>_hapmap.ped
+outputformat: hapmapSTRAT
+genotypeoutname: <cohort>_hapmap.eigenstratgeno
+snpoutname: <cohort>_hapmap.snp
+indivoutname: <cohort>_hapmap.ind
+familynames: NO
+EOF
+
+convertf -p <cohort>_PAR.conv.txt
+
+rm -f <cohort>_PAR.conv.txt
+
+#### eigen all -
+
+cat << EOF > <cohort>_PAR.eigen.txt
+genotypename: <cohort>_hapmap.eigenstratgeno
+snpname: <cohort>_hapmap.snp
+indivname: <cohort>_hapmap.ind
+evecoutname: <cohort>_hapmap.pca.evec
+evaloutname: <cohort>_hapmap.eval
+altnormstyle: NO
+numoutevec: 10
+numoutlieriter: 5
+numoutlierevec: 10
+outliersigmathresh: 6
+qtmode: 0
+EOF
+
+smartpca -p <cohort>_PAR.eigen.txt > <cohort>_PAR.eigen.log
+
+python $ROOTDIR/parseEigen.py <cohort>_hapmap.pca.evec $ROOTDIR/relationships_w_pops_121708.txt > <cohort>_hapmap.pca.evec.strata
+
+python $ROOTDIR/strataFlip.py <cohort>_hapmap.pca.evec.strata
+
+rm -f <cohort>_PAR.eigen.txt <cohort>_PAR.eigen.log
+
+rm -f <cohort>_PCA_plink.* <cohort>_hapmap.{eval,ind,log,map,nosex,ped,snp,eigenstratgeno,pca.evec}
+
+#### plot all -
+##R
+
+source('/home/bioinfo/software/knightlab/soft/pcaHapmap_Mar2016/eigenPlot.R')
+eigen_plot('<cohort>', '<cohort>_hapmap.pca.evec.strata')

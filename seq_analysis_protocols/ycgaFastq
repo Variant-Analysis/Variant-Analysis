@@ -1,0 +1,809 @@
+#!/usr/bin/env python
+
+import sys
+import datetime
+import getpass
+import inspect
+import os
+import re
+import subprocess
+
+BINDIR = os.path.dirname(os.path.realpath(inspect.stack()[0][1]))
+
+# Translation paths for the PANFS translations.
+
+PANFSROOT="/ycga-gpfs/sequencers"
+PANFSALIAS1="/gpfs/scratch/ycga/data"
+PANFSALIAS2="/gpfs/project/ycga/data"
+
+EXTDIRPREFIX="http://sysg1.cs.yale.edu:3010/"
+EXTDIRPREFIX2="sysg1.cs.yale.edu:3010/"
+EXTDIRPREFIX3="http://fcb.ycga.yale.edu:3010/"
+EXTDIRPREFIX4="fcb.ycga.yale.edu:3010/"
+EXTDIRROOT="/ycga-gpfs/project/fas/lsprog/tools/external/data"
+
+# Objects for holding core information about the run data.
+
+class File:
+    """Object for holding information about each export or fastq file."""
+    def __init__(self):
+        self.path = ""
+        self.flowcell = ""
+        self.lane = ""
+        self.pair = ""
+        self.filecnt = ""
+        self.basename = ""
+
+class Sample:
+    """Object for holding the information and files for each sample."""
+    def __init__(self):
+        self.name = ""
+        self.status = "New"   # Allowed values:  New, Error, Exists, Addition
+        self.fastqFiles = []
+
+# Main Routine
+
+def main():
+    options = {}
+    arglist = parseArgs(options)
+
+    (samples, errorFlag, archiveFlag) = checkArgs(arglist)
+
+    if len(samples) == 0:
+        sys.exit(-1)
+
+    checkSampleInfo(samples)
+
+    if not options['forceFlag']:
+        askToStop(samples, errorFlag)
+
+    makeDirs(samples, options['outputDir'])
+
+    if archiveFlag:
+        subprocess.call("%s/updateFastq -n %s" % (BINDIR, " ".join(samples.keys())), shell=True)
+
+def parseArgs(options):
+    options['forceFlag'] = False
+    options['outputDir'] = "."
+
+    arg = 1
+    while arg < len(sys.argv):
+        if sys.argv[arg] == '-f':
+            options['forceFlag'] = True
+            arg += 1
+        elif arg + 1 < len(sys.argv) and sys.argv[arg] == '-o':
+            options['outputDir'] = sys.argv[arg+1].rstrip("/")
+            arg += 2
+        else:
+            break
+
+    if arg == len(sys.argv):
+        usage("")
+
+    arglist = []
+    if arg + 1 == len(sys.argv) and os.path.isfile(sys.argv[arg]):
+        fp = open(sys.argv[arg])
+        for line in fp:
+            if line.strip():
+                arglist.append(line.strip().split())
+        fp.close()
+    else:
+        arglist.append(sys.argv[arg:])
+
+    return arglist
+
+def isExtDirUrl(l):
+    return len(l) == 1 and (l[0].startswith(EXTDIRPREFIX) or l[0].startswith(EXTDIRPREFIX2) or \
+                            l[0].startswith(EXTDIRPREFIX3) or l[0].startswith(EXTDIRPREFIX4)) and l[0].find("/sample_dir_") != -1
+
+def checkArgs(arglist):
+    samples = {}
+    errorFlag = False
+    archiveFlag = False
+
+    # Check for the new YCGA sample tracking URL's and replace them with the sample paths.
+    if sum([ 1 for l in arglist if isExtDirUrl(l) ]) > 0:
+        newarglist = []
+        for l in arglist:
+            
+            if not isExtDirUrl(l):
+                newarglist.append(arg)
+            else:
+                extdir = os.path.realpath(EXTDIRROOT + "/" + l[0].replace(EXTDIRPREFIX, "").replace(EXTDIRPREFIX2, "").replace(EXTDIRPREFIX3, "").replace(EXTDIRPREFIX4, ""))
+                extdir = extdir.rstrip("/")
+                for file in os.listdir(extdir):
+                    if file.startswith("Sample_"):
+                        path = extdir + "/" + file
+                        newarglist.append([ os.readlink(path) ])
+        arglist = newarglist
+
+    for l in arglist:
+        aflag = False
+
+        if len(l) == 3 and l[2].startswith("Unaligned"):
+            l = [ l[0], l[2], l[1] ]
+
+        dirOrUrl = l[-1]
+        if dirOrUrl.find("showrun?run=") != -1:
+            pos = dirOrUrl.find("?run=") + 5
+            dir = dirOrUrl[pos:].strip()
+
+            # If it is a URL, add on the prefix to translate the URL into a run directory path.
+            if dir.startswith("gpfs_illumina"):
+                dir = "/ycga-gpfs/sequencers/illumina" + dir.replace("gpfs_illumina", "")
+                if not os.path.isdir(dir):
+                    warn("Error:  Directory for run URL cannot be found:  " + dirOrUrl)
+                    errorFlag = True
+                    continue
+            elif checkdir(PANFSROOT + "/panfs/" + dir + "/Data/Intensities/BaseCalls"):
+                dir = PANFSROOT + "/panfs/" + dir
+            elif checkdir("/gpfs/ycga/sequencers/ycga-ba/" + dir + "/Data/Intensities/BaseCalls"):
+                dir = "/gpfs/ycga/sequencers/ycga-ba/" + dir
+            elif checkdir("/gpfs/ycga/sequencers/" + dir + "/Data/Intensities/BaseCalls"):
+                dir = "/gpfs/ycga/sequencers/" + dir
+            else:
+                warn("Error:  Directory for run URL cannot be found:  " + dirOrUrl)
+                errorFlag = True
+                continue
+
+            if dir.find("/Data/Intensities/BaseCalls") == -1:
+                dir += "/Data/Intensities/BaseCalls"
+
+            dirOrUrl = dir
+
+        # Perform the PANFS translation into the current location of the /panfs runs.
+        if dirOrUrl.startswith("/panfs/"):
+            dirOrUrl = PANFSROOT + dirOrUrl
+        elif dirOrUrl.startswith(PANFSALIAS1):
+            dirOrUrl = dirOrUrl.replace(PANFSALIAS1, PANFSROOT)
+        elif dirOrUrl.startswith(PANFSALIAS2):
+            dirOrUrl = dirOrUrl.replace(PANFSALIAS2, PANFSROOT)
+        elif dirOrUrl.startswith("/ycga-ba/"):
+            dirOrUrl = '/gpfs/ycga/sequencers' + dirOrUrl
+
+        # At this point, dirOrUrl should be a path to an existing sequencing run, but which may have been
+        # archived.
+        if dirOrUrl.find("/Data/Intensities/BaseCalls") == -1:
+            runpath = dirOrUrl
+            subpath = ""
+        else:
+            (runpath, subpath) = dirOrUrl.split("/Data/Intensities/BaseCalls")
+            subpath.lstrip("/")
+
+        # If the path is not to a run directory, then the dirOrUrl must be a flowcell name, or an error
+        if not checkdir(runpath):
+            
+            runstr = runcmd("python /home/jk2269/binpy/getflowcells.py")
+            runs = [ run for run in runstr.split("\n") if run.find(runpath) != -1 ]
+
+            # if 0 or multiple runs are found, report an error.
+            if len(runs) == 0:
+                warn("Error:  Unable to find sequencing run directory:  %s" % dirOrUrl)
+                errorFlag = True
+                continue
+            elif len(runs) > 1:
+                warn("Error:  Multiple run directories found:  %s" % dirOrUrl)
+                errorFlag = True
+                continue
+            
+            runpath = runs[0].replace(".DELETED", "").replace(".deleted", "")
+
+        # Check whether the run exists, or has been archived, and retrieve the relevant file list.
+        if os.path.isdir(runpath) and not runpath.endswith(".deleted"):
+            filelist = getRunFiles(runpath)
+        elif os.path.isfile(runpath + ".DELETED"):
+            filelist = getArchiveFiles(runpath + ".DELETED")
+            aflag = True
+        elif os.path.isfile(runpath + ".deleted/DELETED"):
+            filelist = getArchiveFiles(runpath + ".deleted/DELETED")
+            aflag = True
+        else:
+            warn("Error:  Unable to find sequencing run directory:  %s" % dirOrUrl)
+            errorFlag = True
+            continue
+
+        # At this point, we have a valid run directory, and can try to find the fastq files.
+        if len(l) == 3 and l[1].isdigit():
+            sampleName = l[0]
+            lane = l[1]
+            flag = geraldMatch(samples, filelist, subpath, lane, sampleName, dirOrUrl)
+            if flag:
+                errorFlag = True
+            elif aflag:
+                archiveFlag = True
+            continue
+        
+        if len(l) == 3:
+            sampleName = l[0]
+            if l[1].startswith("Unaligned") and not subpath:
+                f = l[1].split("/")
+                if len(f) == 1:
+                    subpath = l[1]
+                    pathProject = l[0]
+                    flag = projectMatch(samples, filelist, subpath, pathProject, "", dirOrUrl)
+                    if flag:
+                        errorFlag = True
+                    elif aflag:
+                        archiveFlag = True
+                    continue
+
+                elif len(f) == 2:
+                    subpath = f[0]
+                    projectId = f[1]
+                    pathSample = l[0]
+                else:
+                    subpath = "/".join(f[:-2])
+                    projectId = f[-2]
+                    pathSample = f[-1]
+            elif l[1].find("/") != -1:
+                (projectId, pathSample) = l[1].split("/")
+            else:
+                pathSample = sampleName
+                projectId = l[1]
+            
+            flag = sampleMatch(samples, filelist, subpath, projectId, pathSample, sampleName, dirOrUrl)
+            if flag:
+                errorFlag = True
+            elif aflag:
+                archiveFlag = True
+            continue
+
+        match = re.match("/([^/]+)/Project_([^/]+)/Sample_([^/]+)(/)?$", subpath)
+        if match is not None:
+            pathSample = getSampleName(match.group(3))
+            sampleName = l[0] if len(l) == 2 else pathSample
+            flag = sampleMatch(samples, filelist, match.group(1), match.group(2), pathSample, sampleName, dirOrUrl)
+            if flag:
+                errorFlag = True
+            elif aflag:
+                archiveFlag = True
+            continue
+
+        match = re.match("/([^/]+)/Project_([^/]+)(/)?$", subpath)
+        if match is not None:
+            pathProject = match.group(2)
+            pathSample = l[0] if len(l) == 2 and l[0] != pathProject else ""
+            flag = projectMatch(samples, filelist, match.group(1), pathProject, pathSample, dirOrUrl)
+            if flag:
+                errorFlag = True
+            elif aflag:
+                archiveFlag = True
+            continue
+
+        match = re.match("/([^/]+)(/)?$", subpath)
+        if match is not None:
+            pathProject = l[0] if len(l) == 2 else getpass.getuser()
+            flag = projectMatch(samples, filelist, match.group(1), pathProject, "", dirOrUrl)
+            if flag:
+                errorFlag = True
+            elif aflag:
+                archiveFlag = True
+            continue
+
+        if len(subpath) > 0:
+            warn("Error:  Invalid sequencing path:  %s" % dirOrUrl)
+            errorFlag = True
+            continue
+
+        pathProject = l[0] if len(l) == 2 else getpass.getuser()
+        flag = projectMatch(samples, filelist, "", pathProject, "", dirOrUrl)
+        if flag:
+            errorFlag = True
+        elif aflag:
+            archiveFlag = True
+
+    return (samples, errorFlag, archiveFlag)
+
+def checkdir(dir):
+    idx = dir.find("/Data/Intensities")
+    if idx != -1:
+        dir = dir[:idx]
+
+    if os.path.exists(dir) and os.path.isdir(os.path.abspath(dir)):
+        return True
+    if os.path.isfile(dir + ".DELETED"):
+        return True
+    if os.path.isfile(dir + "/DELETED"):
+        return True
+    if os.path.isfile(dir + ".deleted/DELETED"):
+        return True
+
+    return False
+
+def getSampleName(file):
+    sample = file.replace("Sample_", "")
+    match = re.search("_\d\d\d$", sample)
+    if match is not None:
+        sample = sample[:-4]
+        match = re.search("_\d\d\d$", sample)
+        if match is not None:
+            sample = sample[:-4]
+    return sample
+    
+def getRunFiles(dir):
+    filelist = []
+    rdir = dir + "/Data/Intensities/BaseCalls"
+    for f1 in os.listdir(rdir):
+        if f1.startswith("Unaligned"):
+            unaligned = f1
+            udir = rdir + "/" + f1
+            for f2 in os.listdir(udir):
+                if f2.startswith("Project_"):
+                    project = f2.replace("Project_", "")
+                    pdir = udir + "/" + f2
+                    for f3 in os.listdir(pdir):
+                        if f3.startswith("Sample_"):
+                            sample = getSampleName(f3)
+                            sdir = pdir + "/" + f3
+                            if not os.path.isdir(sdir): continue
+                            for f4 in os.listdir(sdir):
+                                if f4.endswith("fastq.gz") or f4.endswith("fastq.qp"):
+                                    filelist.append((sample, project, unaligned, sdir + "/" + f4))
+                            
+    return filelist
+
+def getArchiveFiles(delfile):
+    filelist = []
+
+    fp = open(delfile)
+    state = 0
+    for line in fp:
+        if state == 0 and line.startswith("Files deleted"):
+            state = 1
+        elif state == 1:
+            if line.startswith("Done with"):
+                break
+
+            f = line.rstrip("\n").split("\t")
+            if not (f[0].endswith("fastq.gz") or f[0].endswith("fastq.qp")):
+                continue
+            if f[0].find("/.Sample_") != -1:
+                continue
+
+            if f[0].find("GERALD") != -1:
+                match = re.search("Data/Intensities/BaseCalls(/.*GERALD[^/]+)/s_(\d)(_\d)?_fastq.qp", f[0])
+                filelist.append((match.group(2), "", match.group(1), f[0]))
+                continue
+
+            match = re.search("BaseCalls/.*(Unalign[^/]+)/Project_([^/]+)/(Sample_[^/]+)", f[0])
+            if match is None:
+                if f[0].find("Undetermined") != -1:
+                    continue
+
+                match = re.search("BaseCalls/.*(Unalign[^/]+)/RQ([^/]+)/(Sample_[^/]+)", f[0])
+                if match is not None:
+                    continue
+
+                match = re.search("BaseCalls/.*(Unalign[^/]+)/(Sample_[^/]+)", f[0])
+                if match is not None:
+                    continue
+
+                match = re.search("BaseCalls/.*(Unalign[^/]+)/([^/]*Metrics)/", f[0])
+                if match is not None:
+                    continue
+
+                sys.stderr.write("Error:  Invalid line in archive file:  %s\n" % f[0])
+                sys.exit(-1)
+
+            filelist.append((getSampleName(match.group(3)), match.group(2), match.group(1), f[0]))
+
+    fp.close()
+
+    return filelist
+
+def getFile(path, sampleName):
+    f = File()
+    f.path = path
+
+    # Check the post-1.8 version of the path first.
+    match = re.match("(.+)/Data/Intensities/BaseCalls/.*/Sample_([^/]+)/.*_(L\d\d\d)_(R\d)_(\d\d\d).fastq.(gz|qp)$", f.path)
+    if match is not None:
+        match2 = re.search("_([A-Z0-9]+)$", match.group(1))
+        if match2 is not None and len(match2.group(1)) >= 9 and len(match2.group(1)) <= 15:
+            f.flowcell = match2.group(1)
+
+        sampleDir = match.group(2)
+        f.lane = match.group(3)
+        f.pair = match.group(4)
+        f.filecnt = match.group(5)
+
+        suffix = match.group(6)
+
+        if f.flowcell:
+            f.basename = sampleName + "_" + f.flowcell + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq." + suffix
+        else:
+            f.basename = sampleName + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq." + suffix
+
+        return f
+
+    # Check the various versions of the pre-1.8 paths next (single-end files are named differently than
+    # paired-end files).
+    #
+    # First check for paired-end files.
+    match = re.match("(.+)/Data/Intensities/.*/GERALD.*/s_(\d)_(\d)_fastq.qp$", f.path)
+    if match is not None:
+        match2 = re.search("_([A-Z0-9]+)$", match.group(1))
+        if match2 is not None and len(match2.group(1)) >= 9:
+            f.flowcell = match2.group(1)
+
+        f.lane = "L00" + match.group(2)
+        f.pair = "R" + match.group(3)
+        f.filecnt = "001"
+
+        if f.flowcell:
+            f.basename = sampleName + "_" + f.flowcell + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq.qp"
+        else:
+            f.basename = sampleName + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq.qp"
+
+        return f
+
+    # Check for single-end files.
+    match = re.match("(.+)/Data/Intensities/.*/GERALD.*/s_(\d)_fastq.qp$", f.path)
+    if match is not None:
+        match2 = re.search("_([A-Z0-9]+)$", match.group(1))
+        if match2 is not None and len(match2.group(1)) >= 9:
+            f.flowcell = match2.group(1)
+
+        f.lane = "L00" + match.group(2)
+        f.pair = "R1"
+        f.filecnt = "001"
+
+        if f.flowcell:
+            f.basename = sampleName + "_" + f.flowcell + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq.qp"
+        else:
+            f.basename = sampleName + "_" + f.lane + "_" + f.pair + "_" + f.filecnt + ".fastq.qp"
+
+        return f
+
+    f.basename = os.path.basename(f.path)
+    return f
+
+def geraldMatch(samples, filelist, subpath, lane, trueSampleName, dirOrUrl):
+    udirs = set()
+    files = []
+    for t in filelist:
+        if (subpath and subpath != t[2]) or lane != t[0]:
+            continue
+
+        udirs.add(t[2])
+        files.append(t[3])
+
+    if len(files) == 0:
+        warn("Error:  No FASTQ files found for project '%s' and sample '%s':  %s" % (pathProject, pathSample, dirOrUrl))
+        return
+
+    if len(udirs) > 1:
+        warn("Error:  Multiple GERALD directories found, please specify path to GERALD directory:  %s" % dirOrUrl)
+        for d in sorted(list(udirs)):
+            warn("             %s" % d)
+        return
+
+    tsn = trueSampleName
+    if tsn not in samples:
+        s = Sample()
+        s.name = tsn
+        samples[tsn] = s
+    for file in files:
+        samples[tsn].fastqFiles.append(getFile(file, tsn))
+        
+def sampleMatch(samples, filelist, pathUdir, pathProject, pathSample, trueSampleName, dirOrUrl):
+    udirs = set()
+    files = []
+    for t in filelist:
+        if (pathUdir and pathUdir != t[2]) or pathProject != t[1] or pathSample != t[0]:
+            continue
+
+        udirs.add(t[2])
+        files.append(t[3])
+
+    if len(files) == 0:
+        warn("Error:  No FASTQ files found for project '%s' and sample '%s':  %s" % (pathProject, pathSample, dirOrUrl))
+        return
+
+    if len(udirs) > 1:
+        warn("Error:  Multiple Unaligned directories found, please specify the Unaligned directory to use:  %s" % dirOrUrl)
+        for d in sorted(list(udirs)):
+            warn("             %s" % d)
+        return
+
+    tsn = trueSampleName if trueSampleName else pathSample
+    if tsn not in samples:
+        s = Sample()
+        s.name = tsn
+        samples[tsn] = s
+    for file in files:
+        samples[tsn].fastqFiles.append(getFile(file, tsn))
+
+def projectMatch(samples, filelist, pathUdir, pathProject, pathSample, dirOrUrl):
+    udirs = set()
+    files = {}
+    for t in filelist:
+        if (pathUdir and pathUdir != t[2]) or pathProject != t[1] or (pathSample and pathSample != t[0]):
+            continue
+
+        udirs.add(t[2])
+        if t[0] not in files:
+            files[t[0]] = []
+        files[t[0]].append(t[3])
+
+    if len(files) == 0:
+        if pathSample:
+            warn("Error:  No FASTQ files found for project '%s' and sample '%s':  %s" % (pathProject, pathSample, dirOrUrl))
+        else:
+            warn("Error:  No FASTQ files found for project '%s':  %s" % (pathProject, dirOrUrl))
+        return
+
+    if len(udirs) > 1:
+        warn("Error:  Multiple Unaligned directories found, please specify path to Unaligned directory:  %s" % dirOrUrl)
+        for d in sorted(list(udirs)):
+            warn("             %s" % d)
+        return
+
+    for sample in files:
+        if sample not in samples:
+            s = Sample()
+            s.name = sample
+            samples[sample] = s
+        for file in files[sample]:
+            samples[sample].fastqFiles.append(getFile(file, sample))
+
+# checkSampleInfo
+#
+# Check that there are no name conflicts with the fastq files to be included (i.e., mainly when the flowcell
+# cannot be read, multiple fastq files will result in the same name when attempting to write the symbolic links).
+# Also, check to see if the files already exist (is this a new sample, or are there existing fastq files for
+# the sample).
+def checkSampleInfo(samples):
+    sampleStatus = {}
+    allfiles = {}
+    for name in samples:
+        sample = samples[name]
+
+        ncnt = 0
+        cnt = 0
+
+        names = set()
+        for f in sample.fastqFiles:
+            if f.basename in names:
+                warn("Error:  Name conflict, more than one FASTQ file will have the same name for sample:  " + sample.name)
+                for f2 in sample.fastqFiles:
+                    if f2.basename == f.basename:
+                        warn("           %s" % (os.path.dirname(f2.path)))
+                sample.status = "Error"
+                break
+
+            names.add(f.basename)
+
+            if f.path in allfiles:
+                warn("Error:  FASTQ file specified for samples '" + allfiles[f.path] + "' and '" + sample.name + "':  " + f.path)
+                samples[allfiles[f.path]].status = "Error"
+                samples[name].status = "Error"
+                break
+
+            allfiles[f.path] = sample.name
+
+            file = sample.name + "/Unaligned/" + f.basename
+            cnt += 1
+            if not (os.path.lexists(file) or os.path.lexists(file + ".link") or
+                    os.path.lexists(file.replace("fastq.gz", "fastq.qp")) or
+                    os.path.lexists(file.replace("fastq.gz", "fastq.qp.link"))):
+                ncnt += 1
+
+        if sample.status == "Error":
+            continue
+
+        if ncnt == 0:
+            sample.status = "Exist"
+        elif ncnt == cnt and not os.path.isdir(sample.name):
+            sample.status = "New"
+        else:
+            sample.status = "Add"
+
+# askToStop
+#
+# In interactive mode, report on the numbers/names of samples to be created and ask the user to continue.
+#
+def askToStop(samples, errorFlag):
+    newcnt = 0
+    addcnt = 0
+    existcnt = 0
+    errorcnt = 0
+    samplecnt = 0
+    for name in samples:
+        samplecnt += 1
+        if samples[name].status == "Error":
+            errorcnt += 1
+        elif samples[name].status == "Exist":
+            existcnt += 1
+        elif samples[name].status == "New":
+            newcnt += 1
+        elif samples[name].status == "Add":
+            addcnt += 1
+
+    plural = ""
+    if samplecnt != 1:
+        plural = "s"
+
+    sys.stdout.write("Found %d sample%s:\n" % (samplecnt, plural))
+    if samplecnt < 10 and newcnt == samplecnt:
+        for name in samples:
+            sys.stdout.write("    %s" % (name, ))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write("    %d with errors\n" % (errorcnt, ))
+        sys.stdout.write("    %d with existing directories\n" % (existcnt, ))
+        sys.stdout.write("    %d with additional files for existing directories\n" % (addcnt, ))
+        sys.stdout.write("    %d new\n" % (newcnt, ))
+    sys.stdout.write("\n")
+
+    if newcnt + addcnt == 0:
+        sys.stdout.write("No new files found.  Stopping.\n")
+        sys.exit(0)
+
+    prompt = "Create the files/directories ('y' or 'n') [y] ? "
+    fp = sys.stdout
+
+    get_input = input
+    try:
+        get_input = raw_input
+    except NameError:
+        pass
+
+    while True:
+        fp.write(prompt)
+        fp.flush()
+        instr = get_input()
+        if len(instr) == 0 or instr.lower() == 'y':
+            break
+        elif instr.lower() == 'n':
+            sys.exit(0)
+        else:
+            fp.write("Please answer 'y' or 'n' (or just hit return).\n")
+
+def makeDirs(samples, outputDir):
+    # Otherwise, create the directories and symbolic links for the fastq files.
+    scnt = 0
+    for name in samples:
+        if samples[name].status == "Error" or samples[name].status == "Exist":
+            continue
+
+        # Make the sample directory and the Unaligned directory inside it.
+        rootdir = outputDir + "/" + name
+        if not os.path.exists(rootdir):
+            os.makedirs(rootdir)
+
+        udir = rootdir + "/Unaligned"
+        if not os.path.exists(udir):
+            os.makedirs(udir)
+
+        # Add all of the fastq files as symbolic links.
+        if len(samples[name].fastqFiles) > 0:
+            for f in samples[name].fastqFiles:
+                file = udir + "/" + f.basename
+                if not (os.path.lexists(file) or os.path.lexists(file + ".link") or 
+                        os.path.lexists(file.replace("fastq.gz", "fastq.qp")) or
+                        os.path.lexists(file.replace("fastq.gz", "fastq.qp.link"))):
+                    os.symlink(os.path.abspath(f.path), file)
+
+    # Log the use of ycgaFastq to "claim" export and fastq directories.
+    try:
+        monthstr = datetime.date.today().strftime("%Y_%m")
+        user = getpass.getuser()
+        datestr = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        logdir = "/gpfs/ycga/project/mane/jk2269/ycgaFastq_logFiles/" + monthstr
+        logfile = logdir + "/" + user + "_" + datestr + ".log"
+        if not os.path.exists(logdir):
+            os.makedirs(logdir)
+            os.chmod(logdir, 0o777)
+
+        fp = open(logfile, "w")
+        for name in samples:
+            if samples[name].status == "Error" or samples[name].status == "Exist":
+                continue
+        
+            rootdir = outputDir + "/" + name
+            rootdir = os.path.abspath(rootdir)
+
+            dirs = set()
+            for f in samples[name].fastqFiles:
+                fdir = os.path.dirname(os.path.abspath(f.path))
+                if fdir not in dirs:
+                    fp.write("%s\t%s\tFastq\t%s\n" % (name, fdir, rootdir))
+                    dirs.add(fdir)
+        fp.close()
+        os.chmod(logfile, 0o666)
+
+    except IOError:
+        pass
+        
+            
+# usage
+#
+# The command-line usage help text.
+#
+def usage(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.write("""
+Usage:  ycgaFastq [-f] [-o outputDir] URL
+        ycgaFastq [-f] [-o outputDir] flowcell
+        ycgaFastq [-f] [-o outputDir] pathToSequencingRunProjectOrSample
+        ycgaFastq [-f] [-o outputDir] netId URL
+        ycgaFastq [-f] [-o outputDir] netId flowcell
+        ycgaFastq [-f] [-o outputDir] sampleName directoryPath
+        ycgaFastq [-f] [-o outputDir] sampleName lane pathToGeraldDirectory
+        ycgaFastq [-f] [-o outputDir] file
+
+   The ycgaFastq program searches for the FASTQ files generated by a YCGA sequencing run, and creates
+   sample directories containing symbolic links to the FASTQ files (or can output a tab-delimited file
+   listing the FASTQ files).  The command-line options are:
+
+      * -f - Force the creation of sample directories and disable interactive output
+      * -o outputDir - Create the sample directories in "outputDir"
+
+   The arguments to ycgaFastq can be in one of several forms (in order to support the common forms
+   of identifying run information):
+
+      * The arguments can be "URL" or "projectName URL", where the URL is a URL found from the emails
+        sent by the YCGA notifying of a sequencing run result, and projectName is the netId of the project
+        containing the data.  If no netId given, the netId of the current user is used.  All sample directories
+        matching "URLdir/Data/Intensities/BaseCalls/Unaligned*/Project_projectName/Sample_*" are identified as
+        FASTQ directories, and the sampleName values are extracted from the path.
+
+      * The arguments can be a full path into the sequencing run directories, down to the level of a specific
+        "Project_" or "Sample_" sub-directory.  If the path ends at the Project directory, all samples in the
+        Project directory will be included.
+
+      * The arguments can be a netId and flowcell string (like AHJNHMADXX).  In this case, the appropriate run
+        path is identified, and then all of the samples in the "Project_netId" sub-directory are included.
+        (Note:  If there are multiple Unaligned directories for this run, an error will be reported, and the
+                specific path to the Project directory must be given.)
+
+      * The arguments can be "sampleName directoryPath", where the directoryPath is a path to an "Unaligned"
+        sequencing run directory, where the path must be specified down to the "Project_..." or "Sample_..."
+        level (if only specified down to the "Project_..." level, there must be a sub-directory matching
+        "Sample_sampleName*" inside the project directory)
+
+      * A trio of three arguments, "Sample Lane GERALD_Directory", for older sequencing runs (pre-1.8), or 
+        "netId Flowcell UnalignedDir" for newer sequencing runs.
+            Note:  For older runs (pre-1.8), this is the only acceptable format to identify FASTQ files
+                   for those runs.  All other argument forms look only for the CASAVA 1.8 run folder
+                   structure (or use the given directory as containing the FASTQ files)
+
+      * A single file that contains lines in any of the above formats (so you can submit many of these
+        all at once)
+
+   A fraction of sequencing runs may have multiple "Unaligned" directories, because of run
+   processing issues.  In those cases, it may not be possible to automatically determine the correct
+   Unaligned directory containing the FASTQ files, and the program will stop processing at that point
+   and report the situation.  In those cases, the full path to each sample's Unaligned directory is
+   required as input, in order to correctly identify the FASTQ files.
+
+   By default, the program will create a sample directory for each sample, using the sample name, and
+   then create an "Unaligned" sub-directory to hold the symbolic links to FASTQ files found in the search.
+   (This provides reliable pointers back into the sequencing data files.)  If the sequencing run path
+   information is found as part of the search, the FASTQ files will be given the name
+   "Sample_Flowcell_Lane_R#_###.fastq.gz", to ensure that the files are uniquely identified.  If an arbitrary
+   directory is given as input, the current names of the FASTQ files will be retained in the symbolic links.
+""")
+    sys.exit(-1)
+
+
+def runcmd(cmd):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=-1, universal_newlines=True)
+    (outstr, errstr) = p.communicate()
+    if p.returncode != 0:
+        sys.stderr.write(errstr)
+        sys.exit(-1)
+
+    return outstr
+
+def die(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(-1)
+
+def warn(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+if __name__ == "__main__":
+    main()
