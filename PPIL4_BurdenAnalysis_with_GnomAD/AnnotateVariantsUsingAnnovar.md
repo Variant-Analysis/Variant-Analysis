@@ -23,4 +23,7 @@ For reference and citation: https://github.com/bio-ontology-research-group/VSIM/
  * pip install fisher
  * python filterVariantsAndCountAlleles.py [PPIL_gnomAD_annovar.csv](./PPIL_gnomAD_annovar.csv)
 
+Variant filtering in gnomAD (version 2.1.1) for non-Finnish + Finnish control data was performed using aforementioned inclusion criteria. Variants that were flagged (LOFTEE) by gnomAD (version 2.1.1) for low confidence were assessed in dbSNP database (https://www.ncbi.nlm.nih.gov/snp/), whether any clinical information was associated with the variant and were excluded if no pathogenicity was reported.
+
+
 
